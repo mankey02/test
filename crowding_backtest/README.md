@@ -10,6 +10,8 @@ pip install -r requirements.txt
 
 # 1) 데이터 수집 (Bybit 권장: OI 과거 데이터가 길다. Binance는 OI 최근 30일만 제공)
 python fetch_data.py --exchange bybit --symbol BTCUSDT --start 2021-01-01
+#    거래소 API가 지역 차단되면: 바이낸스 공식 과거 데이터 저장소(OI 포함, 이번 달 제외)
+python fetch_data.py --exchange binance_vision --symbol BTCUSDT --start 2021-01-01
 
 # 2) 검증
 python backtest.py --data data/bybit_BTCUSDT_1h.csv

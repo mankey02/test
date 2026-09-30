@@ -3,6 +3,7 @@
 사용 예:
     python fetch_data.py --exchange bybit --symbol BTCUSDT --start 2021-01-01
     python fetch_data.py --exchange binance --symbol ETHUSDT --start 2022-01-01
+    python fetch_data.py --exchange binance_vision --symbol BTCUSDT --start 2021-01-01
 
 출력: data/{exchange}_{symbol}_1h.csv
     time     : 봉 마감 시각(UTC). 이 시점에 close/funding/oi 가 모두 "이미 알려진" 값이다.
@@ -12,10 +13,16 @@
 
 주의:
     - Binance 의 OI 히스토리 API 는 최근 30일만 제공한다. 장기 검증은 Bybit 를 권장.
+    - binance_vision 은 바이낸스 공식 과거 데이터 저장소(data.binance.vision)에서 받는다.
+      거래소 API 가 지역 차단될 때 쓸 수 있고, OI 도 수년치가 있다.
+      단, 펀딩비는 월 단위 파일만 있어서 이번 달 데이터는 빠진다.
     - 예측 펀딩비(실시간 값)는 과거 기록이 없으므로 "정산된 펀딩비"만 사용한다.
 """
 import argparse
+import io
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -144,9 +151,95 @@ def binance_oi(symbol, start, end):
                          "oi": [float(r["sumOpenInterest"]) for r in rows]})
 
 
+# ------------------------------------------- Binance 공식 과거 데이터 (zip 파일)
+VISION = "https://data.binance.vision/data/futures/um"
+
+
+def _vision_csv(path):
+    """zip 안의 CSV 를 읽는다. 파일이 없으면(404) None."""
+    for i in range(5):
+        try:
+            r = _session.get(f"{VISION}/{path}", timeout=30)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            break
+        except requests.RequestException:
+            if i == 4:
+                raise
+            time.sleep(2 ** i)
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        df = pd.read_csv(z.open(z.namelist()[0]), header=None, dtype=str)
+    # 오래된 파일은 헤더가 없고 최근 파일은 헤더가 있다 → 헤더 행을 제거
+    first = df.iloc[0, 0]
+    if not first[:1].isdigit():
+        df.columns = df.iloc[0]
+        df = df.iloc[1:]
+    return df
+
+
+def _months(start, end):
+    s = pd.Timestamp(start, unit="ms").to_period("M")
+    e = pd.Timestamp(end, unit="ms").to_period("M")
+    return [str(p) for p in pd.period_range(s.to_timestamp(), e.to_timestamp(), freq="M")]
+
+
+def _days(start, end):
+    s = pd.Timestamp(start, unit="ms", tz="UTC").normalize()
+    e = pd.Timestamp(end, unit="ms", tz="UTC").normalize()
+    return [d.strftime("%Y-%m-%d") for d in pd.date_range(s, e, freq="D")]
+
+
+def _fetch_many(paths):
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return [d for d in ex.map(_vision_csv, paths) if d is not None]
+
+
+def vision_klines(symbol, start, end):
+    frames = []
+    for m in _months(start, end):
+        d = _vision_csv(f"monthly/klines/{symbol}/1h/{symbol}-1h-{m}.zip")
+        if d is None:  # 이번 달은 월 파일이 아직 없으므로 일 파일로 채운다
+            days = [x for x in _days(start, end) if x.startswith(m)]
+            frames += _fetch_many(f"daily/klines/{symbol}/1h/{symbol}-1h-{x}.zip" for x in days)
+        else:
+            frames.append(d)
+    if not frames:
+        return pd.DataFrame(columns=["open_ms", "close"])
+    k = pd.concat([f.iloc[:, [0, 4]].set_axis(["open_ms", "close"], axis=1) for f in frames])
+    k["open_ms"] = k["open_ms"].astype("int64")
+    k.loc[k["open_ms"] > 10 ** 14, "open_ms"] //= 1000  # 마이크로초 표기 대비
+    k["close"] = k["close"].astype(float)
+    return k[(k["open_ms"] >= start) & (k["open_ms"] <= end)]
+
+
+def vision_funding(symbol, start, end):
+    frames = _fetch_many(f"monthly/fundingRate/{symbol}/{symbol}-fundingRate-{m}.zip"
+                         for m in _months(start, end))
+    if not frames:
+        return pd.DataFrame(columns=["ms", "funding"])
+    f = pd.concat([x.iloc[:, [0, 2]].set_axis(["ms", "funding"], axis=1) for x in frames])
+    f = f.astype({"ms": "int64", "funding": float})
+    return f[(f["ms"] >= start) & (f["ms"] <= end)]
+
+
+def vision_oi(symbol, start, end):
+    frames = _fetch_many(f"daily/metrics/{symbol}/{symbol}-metrics-{d}.zip"
+                         for d in _days(start, end))
+    if not frames:
+        return pd.DataFrame(columns=["ms", "oi"])
+    m = pd.concat(frames)
+    t = pd.to_datetime(m["create_time"], utc=True)
+    m = pd.DataFrame({"t": t, "oi": m["sum_open_interest"].astype(float)})
+    m = m[m["t"].dt.minute == 0]  # 5분 간격 → 정시 값만
+    ms = (m["t"] - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(milliseconds=1)
+    return pd.DataFrame({"ms": ms.to_numpy(), "oi": m["oi"].to_numpy()})
+
+
 SOURCES = {
     "bybit": (bybit_klines, bybit_funding, bybit_oi),
     "binance": (binance_klines, binance_funding, binance_oi),
+    "binance_vision": (vision_klines, vision_funding, vision_oi),
 }
 
 
@@ -178,6 +271,14 @@ def build(exchange, symbol, start, end):
 
     df = _asof(k, f, "funding")
     df = _asof(df, oi, "oi")
+
+    # 펀딩비/OI 기록이 끝난 뒤의 봉은 오래된 값이 계속 이어붙으므로 잘라낸다
+    for d, gap in ((f, 8), (oi, 1)):
+        if not d.empty:
+            last = pd.to_datetime(d["ms"].max() + gap * HOUR_MS, unit="ms", utc=True)
+            if df["time"].max() > last:
+                print(f"  데이터 끝 {last} 이후 봉은 제외")
+                df = df[df["time"] <= last]
     return df
 
 
